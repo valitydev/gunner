@@ -1,13 +1,13 @@
 -module(gunner_pool).
 
+-include("gunner_events.hrl").
+
 %% API functions
 
 -export([start_pool/1]).
 -export([start_pool/2]).
 -export([stop_pool/1]).
 -export([start_link/2]).
-
--export([pool_status/2]).
 
 -export([acquire/3]).
 -export([acquire/4]).
@@ -54,13 +54,17 @@
 %% @doc Gun opts used when creating new connections in this pool. See `gun:opts/0`.
 -type connection_opts() :: gun:opts().
 
+%% @doc Event handler for the pool.
+-type event_handler() :: gunner_event_h:handler().
+
 -type pool_opts() :: #{
     cleanup_interval => cleanup_interval(),
     max_connection_load => max_connection_load(),
     max_connection_idle_age => max_connection_idle_age(),
     max_size => max_size(),
     min_size => min_size(),
-    connection_opts => connection_opts()
+    connection_opts => connection_opts(),
+    event_handler => event_handler()
 }.
 
 -type group_id() :: term().
@@ -70,7 +74,7 @@
 -type acquire_error() ::
     pool_not_found |
     pool_unavailable |
-    {failed_to_start_connection | connection_failed, _}.
+    {connection_failed, _}.
 
 -type locking() :: boolean().
 
@@ -88,6 +92,7 @@
 -export_type([max_size/0]).
 -export_type([min_size/0]).
 -export_type([pool_opts/0]).
+-export_type([event_handler/0]).
 
 -export_type([group_id/0]).
 -export_type([pool_status_response/0]).
@@ -108,7 +113,8 @@
     starting_count :: size(),
     max_connection_load :: max_connection_load(),
     max_connection_idle_age :: max_connection_idle_age(),
-    cleanup_interval :: cleanup_interval()
+    cleanup_interval :: cleanup_interval(),
+    event_handler :: event_handler()
 }).
 
 -type state() :: #state{}.
@@ -159,6 +165,8 @@
 -define(DEFAULT_MAX_SIZE, 25).
 
 -define(DEFAULT_CLEANUP_INTERVAL, 1000).
+
+-define(DEFAULT_EVENT_HANDLER, {gunner_default_event_h, undefined}).
 
 -define(GUN_UP(ConnectionPid), {gun_up, ConnectionPid, _Protocol}).
 -define(GUN_DOWN(ConnectionPid, Reason), {gun_down, ConnectionPid, _Protocol, Reason, _KilledStreams}).
@@ -217,10 +225,6 @@ acquire(PoolID, Endpoint, Locking, Timeout) ->
 free(PoolID, ConnectionPid) ->
     gen_server:cast(PoolID, {free, ConnectionPid, self()}).
 
--spec pool_status(pool_id(), timeout()) -> {ok, pool_status_response()} | {error, pool_not_found}.
-pool_status(PoolID, Timeout) ->
-    call_pool(PoolID, pool_status, Timeout).
-
 %% API helpers
 
 -spec call_pool(pool_id(), Args :: _, timeout()) -> Response :: _ | no_return().
@@ -241,49 +245,73 @@ init([PoolOpts]) ->
     State = new_state(PoolOpts),
     _ = erlang:process_flag(trap_exit, true),
     _ = erlang:send_after(State#state.cleanup_interval, self(), ?GUNNER_CLEANUP()),
-    {ok, State}.
+    State1 = emit_init_event(PoolOpts, State),
+    {ok, State1}.
 
 -spec handle_call
     ({acquire, endpoint(), locking()}, from(), state()) ->
         {noreply, state()} |
-        {reply, {ok, connection_pid()} | {error, pool_unavailable | {failed_to_start_connection, Reason :: _}},
-            state()};
+        {reply, {ok, connection_pid()} | {error, pool_unavailable | {connection_failed, Reason :: _}}, state()};
     (status, from(), state()) -> {reply, {ok, pool_status_response()}, state()}.
-handle_call({acquire, Endpoint, Locking}, From, State) ->
-    case handle_acquire_connection(Endpoint, Locking, From, State) of
-        {{ok, {connection, Connection}}, NewState} ->
-            {reply, {ok, Connection}, NewState};
-        {{ok, connection_started}, NewState} ->
-            {noreply, NewState};
+handle_call({acquire, Endpoint, Locking}, {ClientPid, _} = From, State0) ->
+    GroupID = create_group_id(Endpoint),
+    State1 = emit_acquire_started_event(GroupID, ClientPid, Locking, State0),
+    case handle_acquire_connection(Endpoint, GroupID, Locking, From, State1) of
+        {{ok, {ready, Connection}}, NewState} ->
+            NewState1 = emit_acquire_finished_event({ok, Connection}, ClientPid, NewState),
+            {reply, {ok, Connection}, NewState1};
+        {{ok, {started, Connection}}, NewState} ->
+            NewState1 = emit_connection_init_started_event(Connection, NewState),
+            {noreply, NewState1};
         {error, Reason} ->
-            {reply, {error, Reason}, State}
-    end;
-handle_call(pool_status, _From, State) ->
-    {reply, {ok, create_pool_status_response(State)}, State}.
+            State2 = emit_acquire_finished_event({error, Reason}, ClientPid, State1),
+            {reply, {error, Reason}, State2}
+    end.
 
 -spec handle_cast({free, connection_pid(), client_pid()}, state()) -> {noreply, state()}.
-handle_cast({free, ConnectionPid, ClientPid}, State) ->
-    {noreply, handle_free_connection(ConnectionPid, ClientPid, State)}.
+handle_cast({free, ConnectionPid, ClientPid}, State0) ->
+    %% Assuming here that the pids we receive are anything close to the ones we
+    %% have in our state is probably not the way to go
+    case get_connection_state(ConnectionPid, State0) of
+        #connection_state{} = ConnSt ->
+            State1 = emit_free_started_event(ConnSt, ClientPid, State0),
+            case handle_free_connection(ConnSt, ClientPid, State1) of
+                {ok, NewState} ->
+                    NewState1 = emit_free_finished_event(ok, ConnSt, ClientPid, NewState),
+                    {noreply, NewState1};
+                not_locked ->
+                    State2 = emit_free_finished_event({error, not_locked}, ConnSt, ClientPid, State1),
+                    {noreply, State2}
+            end;
+        _ ->
+            State1 = emit_free_error_event(connection_not_found, ClientPid, State0),
+            {noreply, State1}
+    end.
 
 -spec handle_info(any(), state()) -> {noreply, state()}.
-handle_info(?GUNNER_CLEANUP(), State) ->
-    State1 = handle_cleanup(State),
-    _ = erlang:send_after(State#state.cleanup_interval, self(), ?GUNNER_CLEANUP()),
-    {noreply, State1};
-handle_info(?GUN_UP(ConnectionPid), State) ->
-    State1 = handle_connection_started(ConnectionPid, State),
-    {noreply, State1};
+handle_info(?GUNNER_CLEANUP(), State0) ->
+    State1 = emit_cleanup_started_event(State0),
+    State2 = handle_cleanup(State1),
+    _ = erlang:send_after(State2#state.cleanup_interval, self(), ?GUNNER_CLEANUP()),
+    State3 = emit_cleanup_finished_event(State2),
+    {noreply, State3};
+handle_info(?GUN_UP(ConnectionPid), State0) ->
+    State1 = emit_connection_init_finished_event(ok, ConnectionPid, State0),
+    State2 = handle_connection_started(ConnectionPid, State1),
+    {noreply, State2};
 handle_info(?GUN_DOWN(_ConnectionPid, _Reason), State) ->
     {noreply, State};
 handle_info(?DOWN(Mref, ClientPid, Reason), State) ->
     State1 = handle_client_down(ClientPid, Mref, Reason, State),
-    {noreply, State1};
+    State2 = emit_client_down_event(ClientPid, Reason, State1),
+    {noreply, State2};
 handle_info(?EXIT(ConnectionPid, Reason), State) ->
     State1 = handle_connection_down(ConnectionPid, Reason, State),
     {noreply, State1}.
 
 -spec terminate(any(), state()) -> ok.
-terminate(_, _St) ->
+terminate(Reason, State) ->
+    _ = emit_terminate_event(Reason, State),
     ok.
 
 %%
@@ -302,23 +330,25 @@ new_state(Opts) ->
         connections = #{},
         connection_opts = maps:get(connection_opts, Opts, ?DEFAULT_CONNECTION_OPTS),
         cleanup_interval = maps:get(cleanup_interval, Opts, ?DEFAULT_CLEANUP_INTERVAL),
-        max_connection_idle_age = maps:get(max_connection_idle_age, Opts, ?DEFAULT_MAX_CONNECTION_IDLE_AGE)
+        max_connection_idle_age = maps:get(max_connection_idle_age, Opts, ?DEFAULT_MAX_CONNECTION_IDLE_AGE),
+        event_handler = maps:get(event_handler, Opts, ?DEFAULT_EVENT_HANDLER)
     }.
 
 %%
 
--spec handle_acquire_connection(endpoint(), locking(), requester(), state()) -> {Result, state()} | Error when
-    Result :: {ok, {connection, connection_pid()} | connection_started},
-    Error :: {error, {failed_to_start_connection, _Reason} | pool_unavailable}.
-handle_acquire_connection(Endpoint, Locking, {ClientPid, _} = From, State) ->
-    GroupID = create_group_id(Endpoint),
+-spec handle_acquire_connection(endpoint(), group_id(), locking(), requester(), state()) ->
+    {Result, state()} | Error
+when
+    Result :: {ok, {started | ready, connection_pid()}},
+    Error :: {error, {connection_failed, _Reason} | pool_unavailable}.
+handle_acquire_connection(Endpoint, GroupID, Locking, {ClientPid, _} = From, State) ->
     case acquire_connection_from_group(GroupID, State) of
         {connection, ConnPid, St1} ->
-            {{ok, {connection, ConnPid}}, maybe_lock_connection(Locking, ConnPid, ClientPid, St1)};
+            {{ok, {ready, ConnPid}}, maybe_lock_connection(Locking, ConnPid, ClientPid, St1)};
         no_connection ->
             case handle_connection_creation(GroupID, Endpoint, From, Locking, State) of
-                {ok, State1} ->
-                    {{ok, connection_started}, State1};
+                {ok, Connection, State1} ->
+                    {{ok, {started, Connection}}, State1};
                 {error, _Reason} = Error ->
                     Error
             end
@@ -375,16 +405,14 @@ get_connection_load(Idx, State) ->
 
 %%
 
--spec handle_free_connection(connection_pid(), client_pid(), state()) -> state().
-handle_free_connection(ConnectionPid, ClientPid, State) ->
-    case get_connection_state(ConnectionPid, State) of
-        #connection_state{status = up, lock = {locked, ClientPid}} = ConnSt ->
-            ConnSt1 = reset_connection_idle(ConnSt),
-            State1 = set_connection_state(ConnectionPid, ConnSt1, State),
-            unlock_connection(ConnectionPid, ClientPid, State1);
-        _ ->
-            State
-    end.
+-spec handle_free_connection(connection_state(), client_pid(), state()) -> {ok, state()} | not_locked.
+handle_free_connection(#connection_state{status = up, lock = {locked, ClientPid}} = ConnSt, ClientPid, State) ->
+    ConnSt1 = reset_connection_idle(ConnSt),
+    State1 = do_unlock_connection(ConnSt1, ClientPid, State),
+    State2 = remove_connection_from_client_state(ConnSt1#connection_state.pid, ClientPid, State1),
+    {ok, State2};
+handle_free_connection(_, _ClientPid, _State) ->
+    not_locked.
 
 %%
 
@@ -416,7 +444,7 @@ free_connection_idx(Idx, State) ->
 %%
 
 -spec handle_connection_creation(group_id(), endpoint(), requester(), locking(), state()) ->
-    {ok, state()} | {error, pool_unavailable | {failed_to_start_connection, Reason :: _}}.
+    {ok, connection_pid(), state()} | {error, pool_unavailable | {connection_failed, Reason :: _}}.
 handle_connection_creation(GroupID, Endpoint, Requester, Locking, State) ->
     case is_pool_available(State) of
         true ->
@@ -424,9 +452,9 @@ handle_connection_creation(GroupID, Endpoint, Requester, Locking, State) ->
             case open_gun_connection(Endpoint, Idx, State) of
                 {ok, Pid} ->
                     ConnectionState = new_connection_state(Requester, GroupID, Idx, Pid, Locking),
-                    {ok, set_connection_state(Pid, ConnectionState, inc_starting_count(State1))};
+                    {ok, Pid, set_connection_state(Pid, ConnectionState, inc_starting_count(State1))};
                 {error, Reason} ->
-                    {error, {failed_to_start_connection, Reason}}
+                    {error, {connection_failed, Reason}}
             end;
         false ->
             {error, pool_unavailable}
@@ -489,7 +517,8 @@ handle_connection_started(ConnectionPid, State) ->
     ok = reply_to_requester({ok, ConnectionPid}, Requester),
     State1 = set_connection_state(ConnectionPid, ConnSt2, State),
     State2 = dec_starting_count(inc_active_count(State1)),
-    maybe_lock_connection(Locking, ConnectionPid, ClientPid, State2).
+    State3 = maybe_lock_connection(Locking, ConnectionPid, ClientPid, State2),
+    emit_acquire_finished_event({ok, ConnectionPid}, ClientPid, State3).
 
 -spec reply_to_requester(term(), requester()) -> ok.
 reply_to_requester(Message, Requester) ->
@@ -501,17 +530,27 @@ reply_to_requester(Message, Requester) ->
 -spec handle_connection_down(connection_pid(), Reason :: _, state()) -> state().
 handle_connection_down(ConnectionPid, Reason, State) ->
     ConnSt = get_connection_state(ConnectionPid, State),
+    %% I want to rewrite all of this so bad
     process_connection_removal(ConnSt, Reason, State).
 
 -spec process_connection_removal(connection_state(), Reason :: _, state()) -> state().
 process_connection_removal(ConnState = #connection_state{status = {starting, Requester, _Locking}}, Reason, State) ->
     ok = reply_to_requester({error, {connection_failed, Reason}}, Requester),
     State1 = free_connection_idx(ConnState#connection_state.idx, State),
-    remove_connection(ConnState, dec_starting_count(State1));
-process_connection_removal(ConnState = #connection_state{status = up}, _Reason, State) ->
-    remove_up_connection(ConnState, State);
+    State2 = emit_connection_init_finished_event(
+        {error, {connection_failed, Reason}},
+        ConnState#connection_state.pid,
+        State1
+    ),
+    {ClientPid, _} = Requester,
+    State3 = emit_acquire_finished_event({error, {connection_failed, Reason}}, ClientPid, State2),
+    remove_connection(ConnState, dec_starting_count(State3));
+process_connection_removal(ConnState = #connection_state{status = up}, Reason, State) ->
+    State1 = emit_connection_down_event({abnormal, Reason}, ConnState#connection_state.pid, State),
+    remove_up_connection(ConnState, State1);
 process_connection_removal(ConnState = #connection_state{status = down}, _Reason, State) ->
-    remove_down_connection(ConnState, State).
+    State1 = emit_connection_down_event(normal, ConnState#connection_state.pid, State),
+    remove_down_connection(ConnState, State1).
 
 -spec remove_up_connection(connection_state(), state()) -> state().
 remove_up_connection(ConnState = #connection_state{idx = ConnIdx}, State) ->
@@ -532,14 +571,15 @@ remove_connection(#connection_state{pid = ConnPid}, State) ->
 -spec handle_client_down(client_pid(), mref(), Reason :: _, state()) -> state().
 handle_client_down(ClientPid, Mref, _Reason, State) ->
     #client_state{mref = Mref, connections = Connections} = get_client_state(ClientPid, State),
-    unlock_client_connections(Connections, State).
+    unlock_client_connections(Connections, ClientPid, State).
 
--spec unlock_client_connections([connection_pid()], state()) -> state().
-unlock_client_connections([], State) ->
+-spec unlock_client_connections([connection_pid()], client_pid(), state()) -> state().
+unlock_client_connections([], _ClientPid, State) ->
     State;
-unlock_client_connections([ConnectionPid | Rest], State) ->
-    State1 = do_unlock_connection(ConnectionPid, State),
-    unlock_client_connections(Rest, State1).
+unlock_client_connections([ConnectionPid | Rest], ClientPid, State) ->
+    ConnectionSt = get_connection_state(ConnectionPid, State),
+    State1 = do_unlock_connection(ConnectionSt, ClientPid, State),
+    unlock_client_connections(Rest, ClientPid, State1).
 
 %%
 
@@ -559,7 +599,8 @@ process_connection_cleanup({Pid, ConnSt, Iter}, SizeBudget, State) when SizeBudg
     CurrentTime = erlang:monotonic_time(millisecond),
     ConnLoad = get_connection_load(ConnSt#connection_state.idx, State),
     case ConnSt of
-        #connection_state{status = up, idle_since = IdleSince, idx = ConnIdx} when
+        %% Locked connections should not be cleaned up when unused
+        #connection_state{status = up, lock = unlocked, idle_since = IdleSince, idx = ConnIdx} when
             IdleSince + MaxAge =< CurrentTime, ConnLoad =:= 0
         ->
             %% Close connection, 'EXIT' msg will remove it from state
@@ -591,7 +632,8 @@ lock_connection(ConnectionPid, ClientPid, State) ->
     State1 = do_lock_connection(ConnectionPid, ClientPid, State),
     ClientSt = get_or_create_client_state(ClientPid, State1),
     ClientSt1 = do_add_connection_to_client(ConnectionPid, ClientSt),
-    set_client_state(ClientPid, ClientSt1, State1).
+    State2 = set_client_state(ClientPid, ClientSt1, State1),
+    emit_connection_locked_event(ConnectionPid, ClientPid, State2).
 
 -spec do_lock_connection(connection_pid(), client_pid(), state()) -> state().
 do_lock_connection(ConnectionPid, ClientPid, State) ->
@@ -603,16 +645,11 @@ do_lock_connection(ConnectionPid, ClientPid, State) ->
 do_add_connection_to_client(ConnectionPid, ClientSt = #client_state{connections = Connections}) ->
     ClientSt#client_state{connections = [ConnectionPid | Connections]}.
 
--spec unlock_connection(connection_pid(), client_pid(), state()) -> state().
-unlock_connection(ConnectionPid, ClientPid, State) ->
-    State1 = do_unlock_connection(ConnectionPid, State),
-    remove_connection_from_client_state(ConnectionPid, ClientPid, State1).
-
--spec do_unlock_connection(connection_pid(), state()) -> state().
-do_unlock_connection(ConnectionPid, State) ->
-    ConnectionSt = get_connection_state(ConnectionPid, State),
+-spec do_unlock_connection(connection_state(), client_pid(), state()) -> state().
+do_unlock_connection(ConnectionSt, ClientPid, State) ->
     ConnectionSt1 = ConnectionSt#connection_state{status = up, lock = unlocked},
-    set_connection_state(ConnectionPid, ConnectionSt1, State).
+    State1 = set_connection_state(ConnectionSt1#connection_state.pid, ConnectionSt1, State),
+    emit_connection_unlocked_event(ConnectionSt1, ClientPid, State1).
 
 -spec remove_connection_from_client_state(connection_pid(), client_pid(), state()) -> state().
 remove_connection_from_client_state(ConnectionPid, ClientPid, State) ->
@@ -691,20 +728,161 @@ dec_starting_count(State) ->
 offset_starting_count(State, Inc) ->
     State#state{starting_count = State#state.starting_count + Inc}.
 
--spec create_pool_status_response(state()) -> pool_status_response().
-create_pool_status_response(State) ->
-    #{
-        total_connections => State#state.active_count + State#state.starting_count,
-        available_connections => get_available_connections_count(State#state.connections)
-    }.
+%%
 
--spec get_available_connections_count(connections()) -> size().
-get_available_connections_count(Connections) ->
-    maps:fold(
-        fun
-            (_K, #connection_state{status = up, lock = unlocked}, Acc) -> Acc + 1;
-            (_K, #connection_state{}, Acc) -> Acc
-        end,
-        0,
-        Connections
+emit_init_event(PoolOpts, State) ->
+    emit_event(
+        #gunner_pool_init_event{
+            pool_opts = PoolOpts
+        },
+        State
     ).
+
+emit_terminate_event(Reason, State) ->
+    emit_event(
+        #gunner_pool_terminate_event{
+            reason = Reason
+        },
+        State
+    ).
+
+emit_acquire_started_event(GroupID, Client, Locking, State) ->
+    emit_event(
+        #gunner_acquire_started_event{
+            group_id = GroupID,
+            client = Client,
+            is_locking = Locking
+        },
+        State
+    ).
+
+emit_acquire_finished_event({ok, ConnectionPid}, Client, State) ->
+    ConnSt = get_connection_state(ConnectionPid, State),
+    emit_event(
+        #gunner_acquire_finished_event{
+            result = ok,
+            connection = ConnectionPid,
+            group_id = ConnSt#connection_state.group_id,
+            client = Client
+        },
+        State
+    );
+emit_acquire_finished_event(Result = {error, _}, Client, State) ->
+    emit_event(
+        #gunner_acquire_finished_event{
+            result = Result,
+            client = Client
+        },
+        State
+    ).
+
+emit_connection_locked_event(ConnectionPid, ClientPid, State) ->
+    ConnSt = get_connection_state(ConnectionPid, State),
+    emit_event(
+        #gunner_connection_locked_event{
+            connection = ConnectionPid,
+            group_id = ConnSt#connection_state.group_id,
+            client = ClientPid
+        },
+        State
+    ).
+
+emit_connection_unlocked_event(ConnSt, ClientPid, State) ->
+    emit_event(
+        #gunner_connection_unlocked_event{
+            connection = ConnSt#connection_state.pid,
+            group_id = ConnSt#connection_state.group_id,
+            client = ClientPid
+        },
+        State
+    ).
+
+emit_free_started_event(ConnSt, ClientPid, State) ->
+    emit_event(
+        #gunner_free_started_event{
+            connection = ConnSt#connection_state.pid,
+            group_id = ConnSt#connection_state.group_id,
+            client = ClientPid
+        },
+        State
+    ).
+
+emit_free_finished_event(Result, ConnSt, ClientPid, State) ->
+    emit_event(
+        #gunner_free_finished_event{
+            connection = ConnSt#connection_state.pid,
+            group_id = ConnSt#connection_state.group_id,
+            client = ClientPid,
+            result = Result
+        },
+        State
+    ).
+
+emit_free_error_event(Reason, ClientPid, State) ->
+    emit_event(
+        #gunner_free_error_event{
+            client = ClientPid,
+            reason = Reason
+        },
+        State
+    ).
+
+emit_cleanup_started_event(State) ->
+    emit_event(
+        #gunner_cleanup_started_event{
+            active_connections = State#state.active_count
+        },
+        State
+    ).
+
+emit_cleanup_finished_event(State) ->
+    emit_event(
+        #gunner_cleanup_finished_event{
+            active_connections = State#state.active_count
+        },
+        State
+    ).
+
+emit_client_down_event(ClientPid, Reason, State) ->
+    emit_event(
+        #gunner_client_down_event{
+            client = ClientPid,
+            reason = Reason
+        },
+        State
+    ).
+
+emit_connection_init_started_event(ConnectionPid, State) ->
+    ConnState = get_connection_state(ConnectionPid, State),
+    emit_event(
+        #gunner_connection_init_started_event{
+            connection = ConnectionPid,
+            group_id = ConnState#connection_state.group_id
+        },
+        State
+    ).
+
+emit_connection_init_finished_event(Result, ConnectionPid, State) ->
+    ConnState = get_connection_state(ConnectionPid, State),
+    emit_event(
+        #gunner_connection_init_finished_event{
+            result = Result,
+            connection = ConnectionPid,
+            group_id = ConnState#connection_state.group_id
+        },
+        State
+    ).
+
+emit_connection_down_event(Reason, ConnectionPid, State) ->
+    ConnState = get_connection_state(ConnectionPid, State),
+    emit_event(
+        #gunner_connection_down_event{
+            connection = ConnectionPid,
+            group_id = ConnState#connection_state.group_id,
+            reason = Reason
+        },
+        State
+    ).
+
+emit_event(EventData, State) ->
+    State#state{event_handler = gunner_event_h:handle_event(EventData, State#state.event_handler)}.
