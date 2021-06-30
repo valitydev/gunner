@@ -144,9 +144,20 @@ end_per_testcase(_Name, _C) ->
 pool_lifetime_test(_C) ->
     {ok, EventStorage} = gunner_test_event_h:start_storage(),
     PoolRef = {local, test_gunner_pool},
-    PoolOpts = #{event_handler => gunner_test_event_h:make_event_h(EventStorage)},
+    EventHandler = gunner_test_event_h:make_event_h(EventStorage),
+    PoolOpts = #{event_handler => EventHandler},
     {ok, Pid} = gunner:start_pool(PoolRef, PoolOpts),
-    [?pool_init(PoolOpts)] = pop_events(EventStorage),
+    [
+        ?pool_init(#{
+            cleanup_interval := _,
+            max_connection_load := _,
+            max_connection_idle_age := _,
+            max_size := _,
+            min_size := _,
+            connection_opts := _,
+            event_handler := EventHandler
+        })
+    ] = pop_events(EventStorage),
     ?assertEqual({error, already_exists}, gunner:start_pool(PoolRef, PoolOpts)),
     [] = pop_events(EventStorage),
     ?assertEqual(ok, gunner:stop_pool(Pid)),
